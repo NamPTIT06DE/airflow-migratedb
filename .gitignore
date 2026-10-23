@@ -1,6 +1,10 @@
-# Chỉ đưa thư mục dags, config và schema_db lên git, bỏ qua mọi thứ còn lại
+# Chỉ đưa dags, config, schema_db và các file Docker lên git, bỏ qua mọi thứ còn lại
 /*
 !/.gitignore
+!/.dockerignore
+!/Dockerfile
+!/docker-compose.yml
+!/requirements.txt
 !/dags/
 !/dags/**
 !/config/
