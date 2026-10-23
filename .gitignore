@@ -1,0 +1,15 @@
+# Chỉ đưa thư mục dags, config và schema_db lên git, bỏ qua mọi thứ còn lại
+/*
+!/.gitignore
+!/dags/
+!/dags/**
+!/config/
+!/config/**
+!/schema_db/
+!/schema_db/**
+
+# Rác Python
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
