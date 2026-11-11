@@ -81,6 +81,16 @@ services:
     <<: *airflow-common
     container_name: airflow_scheduler
     command: scheduler
+    # LocalExecutor chạy task trong scheduler. Mount Docker socket để
+    # DockerOperator có thể tạo/xóa container bằng Docker Engine trên host.
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./config:/opt/airflow/config
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_SOCKET_GID:-65534}"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
       interval: 30s

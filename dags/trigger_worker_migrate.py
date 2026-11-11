@@ -4,6 +4,7 @@ from datetime import datetime
 
 from airflow.decorators import dag, task
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+# from airflow.providers.docker.operators.docker import DockerOperator
 from airflow.providers.ssh.operators.ssh import SSHOperator
 
 
@@ -51,6 +52,7 @@ def trigger_worker_migrate():
     workers = []
 
     for i in range(NUM_WORKERS):
+        # Phương án đang dùng: chạy image trên Docker host thông qua SSH.
         worker_task = SSHOperator(
             task_id=f"trigger_worker_migrate_{i}",
             ssh_conn_id=SSH_CONN_ID,
@@ -59,6 +61,24 @@ def trigger_worker_migrate():
             get_pty=True,
             do_xcom_push=True,
         )
+
+        # Phương án DockerOperator:
+        # Khi chuyển sang phương án này, hãy comment khối SSHOperator phía trên,
+        # bỏ comment import DockerOperator và khối bên dưới.
+        # worker_task = DockerOperator(
+        #     task_id=f"trigger_worker_migrate_{i}",
+        #     image=WORKER_IMAGE,
+        #     command=f"--nums_pull_chunk {NUM_CHUNKS_PER_WORKER}",
+        #     docker_url=os.getenv("DOCKER_URL", "unix:///var/run/docker.sock"),
+        #     network_mode="host",
+        #     extra_hosts={"host.docker.internal": "host-gateway"},
+        #     env_file="/opt/airflow/config/worker_migrate.env",
+        #     mount_tmp_dir=False,
+        #     auto_remove="force",
+        #     force_pull=False,
+        #     do_xcom_push=True,
+        #     xcom_all=False,
+        # )
 
         workers.append(worker_task)
 
