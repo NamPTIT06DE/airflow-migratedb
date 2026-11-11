@@ -17,3 +17,7 @@
 *.pyc
 *.pyo
 *.pyd
+
+# Chứa mật khẩu Oracle dùng cho DockerOperator, không commit lên Git.
+/dags/grant_oracle.env
+/dags/init_chunk_data.env

@@ -1,25 +1,44 @@
-from airflow.operators.trigger_dagrun import TriggerDagRunOperator
-from airflow.providers.docker.operators.docker import DockerOperator
-from airflow.decorators import dag, task
-from datetime import datetime
 import os
+import shlex
+from datetime import datetime
+
+from airflow.decorators import dag, task
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.providers.ssh.operators.ssh import SSHOperator
 
 
-def _load_env_file(filepath: str) -> dict:
-    """Đọc file .env và trả về dict {KEY: VALUE}. Bỏ qua dòng trống và comment."""
-    env = {}
-    with open(filepath, "r") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            key, _, value = line.partition("=")
-            env[key.strip()] = value.strip()
-    return env
+WORKER_IMAGE = os.getenv(
+    "MIGRATE_WORKER_IMAGE", "namnguyendevsonet/migrate-data:v2"
+)
+SSH_CONN_ID = os.getenv(
+    "DOCKER_HOST_SSH_CONN_ID", "docker_host_run_images"
+)
+WORKER_ENV_FILE = os.getenv(
+    "MIGRATE_WORKER_ENV_FILE",
+    "/home/nguyennam/SONET/airflow-migratedb/config/worker_migrate.env",
+)
+NUM_WORKERS = int(os.getenv("MIGRATE_NUM_WORKERS", "3"))
+NUM_CHUNKS_PER_WORKER = int(os.getenv("MIGRATE_CHUNKS_PER_WORKER", "1"))
 
 
-# Đường dẫn tới file worker.env (cùng thư mục với DAG này)
-_WORKER_ENV_PATH = os.path.join(os.path.dirname(__file__), "worker.env")
+def _docker_worker_command() -> str:
+    """Chạy một worker bằng image có sẵn trên Docker host."""
+    return " ".join(
+        [
+            "docker run",
+            "--pull=never",
+            "--rm",
+            "--network",
+            "host",
+            "--add-host",
+            "host.docker.internal:host-gateway",
+            "--env-file",
+            shlex.quote(WORKER_ENV_FILE),
+            shlex.quote(WORKER_IMAGE),
+            "--nums_pull_chunk",
+            str(NUM_CHUNKS_PER_WORKER),
+        ]
+    )
 
 
 @dag(
@@ -29,22 +48,16 @@ _WORKER_ENV_PATH = os.path.join(os.path.dirname(__file__), "worker.env")
     catchup=False,
 )
 def trigger_worker_migrate():
-    NUM_WORKERS = 3
     workers = []
 
-    worker_env = _load_env_file(_WORKER_ENV_PATH)
-
     for i in range(NUM_WORKERS):
-        worker_task = DockerOperator(
+        worker_task = SSHOperator(
             task_id=f"trigger_worker_migrate_{i}",
-            image="namnguyendevsonet/migrate-data:v2",
-            command="--nums_pull_chunk 1",
-            docker_url="tcp://host.docker.internal:2375",
-            network_mode="host",
-            auto_remove="force",
+            ssh_conn_id=SSH_CONN_ID,
+            command=_docker_worker_command(),
+            cmd_timeout=None,
+            get_pty=True,
             do_xcom_push=True,
-            xcom_all=False,  # Chỉ lấy dòng CUỐI CÙNG của stdout (JSON summary)
-            environment=worker_env,
         )
 
         workers.append(worker_task)
@@ -52,6 +65,7 @@ def trigger_worker_migrate():
     @task
     def monitor_worker_job(**context):
         """Pull XCom từ tất cả worker, log chi tiết và trả về JSON thống kê chunk."""
+        import base64
         import json
         from datetime import datetime, timezone
 
@@ -70,6 +84,19 @@ def trigger_worker_migrate():
                     f"[WORKER {i}] Không có XCom (worker có thể đã lỗi hoặc không chạy)"
                 )
                 continue
+
+            # SSHOperator lưu stdout vào XCom dưới dạng Base64 khi Airflow tắt
+            # XCom pickling. Log task trên UI vẫn hiển thị dạng văn bản bình thường.
+            if isinstance(xcom_log, bytes):
+                xcom_log = xcom_log.decode("utf-8", errors="replace")
+            elif isinstance(xcom_log, str):
+                try:
+                    xcom_log = base64.b64decode(
+                        xcom_log, validate=True
+                    ).decode("utf-8", errors="replace")
+                except (ValueError, UnicodeDecodeError):
+                    # Giữ nguyên nếu backend XCom đã trả stdout dạng text.
+                    pass
 
             try:
                 if isinstance(xcom_log, str):
@@ -141,12 +168,16 @@ def trigger_worker_migrate():
             f"Tỷ lệ thành công: {ratio_success:.2%} ({chunks_success}/{total_chunks})"
         )
 
-        if ratio_success >= 0.8:
-            print("Tỷ lệ thành công >= 80%. Kích hoạt trigger chạy tiếp DAG!")
+        if chunks_success == total_chunks:
+            print("Tất cả chunk thành công. Kích hoạt lần migrate tiếp theo!")
             return True
-        else:
-            print("Tỷ lệ fail nhiều (< 80%), tạm thời không trigger lại.")
-            return False
+
+        chunks_failed = total_chunks - chunks_success
+        print(
+            f"Có {chunks_failed} chunk lỗi trong lần chạy hiện tại, "
+            "không trigger lần tiếp theo."
+        )
+        return False
 
     trigger_comeback = TriggerDagRunOperator(
         task_id="trigger_next_migrate_run",

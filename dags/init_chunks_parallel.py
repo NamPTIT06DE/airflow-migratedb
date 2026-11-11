@@ -1,116 +1,66 @@
-from airflow.decorators import dag, task
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.oracle.hooks.oracle import OracleHook
-
-from datetime import datetime
 import os
+import shlex
+from datetime import datetime, timedelta
+
+from airflow.decorators import dag
+from airflow.providers.ssh.operators.ssh import SSHOperator
 
 
-def _to_base64(n: int, length: int) -> str:
-    chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
-    result = []
-    for _ in range(length):
-        result.append(chars[n % 64])
-        n //= 64
-    return "".join(reversed(result))
+INIT_CHUNK_IMAGE = os.getenv(
+    "INIT_CHUNK_IMAGE", "service-init-chunk-data:v1"
+)
+PLATFORM_NETWORK = os.getenv(
+    "PLATFORM_DOCKER_NETWORK", "platform_default"
+)
+SSH_CONN_ID = os.getenv(
+    "DOCKER_HOST_SSH_CONN_ID", "docker_host_run_images"
+)
+INIT_CHUNK_ENV_FILE = os.getenv(
+    "INIT_CHUNK_ENV_FILE",
+    "/home/nguyennam/SONET/airflow-migratedb/config/init_chunk_data.env",
+)
 
 
-def _make_rowid(data_obj_id: int, rfile: int, block: int, row: int) -> str:
-    return (
-        _to_base64(data_obj_id, 6)
-        + _to_base64(rfile, 3)
-        + _to_base64(block, 6)
-        + _to_base64(row, 3)
+def _docker_run_command() -> str:
+    """Chạy image init chunk có sẵn trên Docker host."""
+    return " ".join(
+        [
+            "docker run",
+            "--pull=never",
+            "--rm",
+            "--network",
+            shlex.quote(PLATFORM_NETWORK),
+            "--env-file",
+            shlex.quote(INIT_CHUNK_ENV_FILE),
+            shlex.quote(INIT_CHUNK_IMAGE),
+        ]
     )
 
 
 @dag(
     dag_id="init_chunks",
+    description=(
+        "Chạy image one-shot để tạo bảng PostgreSQL và khởi tạo Oracle chunks"
+    ),
     start_date=datetime(2022, 1, 1),
     schedule=None,
     catchup=False,
-    tags=["init_chunks"],
+    default_args={
+        "owner": "airflow",
+        "retries": 1,
+        "retry_delay": timedelta(minutes=1),
+    },
+    tags=["init_chunks", "oracle", "postgres", "docker", "ssh"],
 )
 def init_chunks():
-    @task
-    def generate_checkpoints_insert_to_db():
-
-        owner = os.getenv("ORACLE_TABLE_OWNER")
-        table = os.getenv("ORACLE_TABLE_NAME")
-        target_rows = int(os.getenv("TARGET_ROWS_PER_CHUNK", "5000"))
-
-        oracle_conn = OracleHook(oracle_conn_id="oracle_user").get_conn()
-        oracle_cursor = oracle_conn.cursor()  # Sửa lỗi: Chưa khởi tạo oracle_cursor
-
-        # 1. Tạo một tác vụ chunking trong Oracle
-        oracle_cursor.execute(
-            "BEGIN dbms_parallel_execute.create_task(task_name => 'MY_CHUNK_TASK_3'); END;"
-        )
-
-        # 2. sinh chunk theo row, mỗi chunk ~target_rows dòng
-        oracle_cursor.execute(
-            """
-                    BEGIN 
-                        dbms_parallel_execute.create_chunks_by_rowid(
-                            task_name   => 'MY_CHUNK_TASK_3',
-                            table_owner => :owner,
-                            table_name  => :tbl_name,
-                            by_row      => TRUE,
-                            chunk_size  => :chunk_size
-                        );
-                    END;
-                """,
-            {"owner": owner, "tbl_name": table, "chunk_size": target_rows},
-        )
-
-        # lay danh sách chunk
-        oracle_cursor.execute(
-            """
-             SELECT chunk_id, start_rowid, end_rowid 
-                    FROM user_parallel_execute_chunks 
-                    WHERE task_name = 'MY_CHUNK_TASK_3'
-                    ORDER BY chunk_id
-        """,
-        )
-
-        row_fetch_oracle = oracle_cursor.fetchall()
-
-        if not row_fetch_oracle:
-            raise ValueError(f"khong tim thay bang {owner}.{table}")
-
-        chunks = [
-            (start_rowid, end_rowid, target_rows)
-            for _, start_rowid, end_rowid in row_fetch_oracle
-        ]
-        return chunks
-
-    @task
-    def insert_info_chunk_to_psql(chunks):
-        pg_hook = PostgresHook(postgres_conn_id="postgres")
-        pg_cursor = pg_hook.get_cursor()
-        schema = os.getenv("POSTGRES_SCHEMA", "public")
-
-        insert_query = f"""
-            INSERT INTO {schema}.migration_chunks 
-                (start_rowid, end_rowid, target_rows, status)
-            VALUES (%s, %s, %s, 'PENDING')
-        """
-
-        try:
-            from psycopg2.extras import execute_batch
-
-            execute_batch(pg_cursor, insert_query, chunks, page_size=100)
-            pg_cursor.connection.commit()
-            print(f"Đã insert {len(chunks)} chunk vào bảng processing_chunks")
-        except Exception as e:
-            pg_cursor.connection.rollback()
-            print(f"Lỗi khi insert chunk vào Postgres: {e}")
-            raise
-        finally:
-            pg_cursor.close()
-
-    chunks = generate_checkpoints_insert_to_db()
-    insert_info_chunk_to_psql(chunks)
+    SSHOperator(
+        task_id="run_init_chunk_image",
+        ssh_conn_id=SSH_CONN_ID,
+        command=_docker_run_command(),
+        cmd_timeout=None,
+        get_pty=True,
+        do_xcom_push=False,
+    )
 
 
 init_chunks()

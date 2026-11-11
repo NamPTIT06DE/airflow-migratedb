@@ -21,8 +21,6 @@ x-airflow-common:
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
     - ./config:/opt/airflow/config
-    - ./data_incoming:/opt/airflow/data_incoming
-    - ../data_update:/opt/airflow/data_update
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     postgres:
@@ -64,7 +62,7 @@ services:
     command: >
       bash -c "rm -f /opt/airflow/airflow-webserver.pid && airflow webserver"
     ports:
-      - "8080:8080"
+      - "8081:8080"
     environment:
       <<: *airflow-common-env
       AIRFLOW__WEBSERVER__WEB_SERVER_WORKER_TIMEOUT: 300
