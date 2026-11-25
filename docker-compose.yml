@@ -21,7 +21,11 @@ x-airflow-common:
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
     - ./config:/opt/airflow/config
+    - ./data_update:/opt/airflow/data_update:ro
   user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - default
+    - platform_net
   depends_on:
     postgres:
       condition: service_healthy
@@ -88,6 +92,7 @@ services:
       - ./logs:/opt/airflow/logs
       - ./plugins:/opt/airflow/plugins
       - ./config:/opt/airflow/config
+      - ./data_update:/opt/airflow/data_update:ro
       - /var/run/docker.sock:/var/run/docker.sock
     group_add:
       - "${DOCKER_SOCKET_GID:-65534}"
@@ -119,4 +124,8 @@ services:
 
 volumes:
   postgres_db_volume:
-    
+
+networks:
+  platform_net:
+    external: true
+    name: platform_default
