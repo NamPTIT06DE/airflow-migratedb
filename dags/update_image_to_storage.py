@@ -1,9 +1,6 @@
-from airflow import DAG
 from airflow.decorators import dag, task
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.providers.docker.operators.docker import DockerOperator
-from docker.types import Mount
 from datetime import datetime, timedelta
 import os
 import re
@@ -18,66 +15,33 @@ args = {
     "retry_delay": timedelta(minutes=2),
 }
 
-
 @dag(
     dag_id="update_image_to_storage",
     default_args=args,
-    schedule="@daily",
+    schedule=None,
     catchup=False,
     tags=["image"],
 )
 def update_image_to_storage():
 
-    # Đường dẫn thư mục trên máy HOST (đọc từ biến môi trường DATA_UPDATE_HOST_FOLDER trong worker.env)
-    host_folder = os.getenv("DATA_UPDATE_HOST_FOLDER", "C:/data_update")
-    # Đường dẫn hiển thị bên trong container con
-    container_folder = "/opt/airflow/data_update"
-
-    # ──────────────────────────────────────────────
-    # Task 1: Mount thư mục từ HOST, quét danh sách file
-    # ──────────────────────────────────────────────
-    scan_task = DockerOperator(
-        task_id="scan_file_from_folder",
-        image="python:3.12-slim",
-        # Quét đệ quy toàn bộ file, in mỗi đường dẫn ra 1 dòng → Airflow bắt làm XCom
-        command=(
-            'python -c "'
-            "import os; "
-            f"files = [os.path.join(r, f) for r, _, fs in os.walk('{container_folder}') for f in fs]; "
-            '[print(p) for p in files]"'
-        ),
-        docker_url="tcp://host.docker.internal:2375",
-        network_mode="host",
-        auto_remove="force",
-        do_xcom_push=True,  # Airflow bắt stdout làm XCom
-        xcom_all=True,  # Lấy toàn bộ output (mỗi dòng = 1 file path)
-        mounts=[
-            Mount(
-                source=host_folder,  # Thư mục gốc trên máy HOST
-                target=container_folder,  # Thư mục bên trong container con
-                type="bind",
-                read_only=True,
-            )
-        ],
-        mount_tmp_dir=False,
+    # Thư mục đã được Docker Compose mount vào Airflow scheduler.
+    container_folder = os.getenv(
+        "DATA_UPDATE_CONTAINER_FOLDER",
+        "/opt/airflow/data_update",
     )
 
     @task
-    def parse_scanned_files(raw_output):
-        """Parse XCom output từ DockerOperator thành list đường dẫn file."""
-        if not raw_output:
-            print("[INFO] Không có file nào được quét.")
+    def parse_scanned_files(folder: str):
+        """Quét trực tiếp thư mục ảnh đã được mount vào Airflow scheduler."""
+        if not os.path.isdir(folder):
+            print(f"[WARN] Thư mục không tồn tại hoặc chưa được mount: {folder}")
             return []
 
-        if isinstance(raw_output, list):
-            # Mỗi item trong list có thể chứa nhiều path ghép bằng \n
-            lines = []
-            for item in raw_output:
-                lines.extend(str(item).splitlines())
-        else:
-            lines = str(raw_output).splitlines()
-
-        files = [line.strip() for line in lines if line.strip()]
+        files = sorted(
+            os.path.join(root, filename)
+            for root, _, filenames in os.walk(folder)
+            for filename in filenames
+        )
         print(f"[INFO] Quét được {len(files)} file:")
         for f in files:
             print(f"  - {f}")
@@ -90,25 +54,52 @@ def update_image_to_storage():
         bucket = os.getenv("S3_BUCKET", "images")
 
         s3Uris = []
-        date_folder = created_at_str = datetime.now().strftime("%Y%m%dT%H%M%S")
 
         for file_path in files_path:
             try:
                 path_obj = Path(file_path)
                 file_name = path_obj.name
+                # Lấy tên thư mục cha trực tiếp chứa ảnh.
+                # Ví dụ: /opt/airflow/data_update/20261123/001001708018.png
+                # thì date_folder = "20261123".
+                date_folder = path_obj.parent.name
                 stem = (
                     path_obj.stem
                 )  # Ví dụ: '010212345678' hoặc '010212345678_20260910'
 
                 parts = re.split(r"[_\-]", stem)
                 cccd = parts[0]
-                # Lấy thời gian tạo/sửa của file vật lý
+
+                # Ưu tiên lấy thời gian nằm sau CCCD trong tên file.
+                # Ví dụ: 010212345678_20260910T162530.jpg
+                time_text = stem[len(cccd) :].lstrip("_-")
+                time_formats = [
+                    "%Y%m%d%H%M%S",      # 20260910162530
+                    "%Y%m%dT%H%M%S",     # 20260910T162530
+                    "%Y%m%d_%H%M%S",     # 20260910_162530
+                ]
+
                 try:
-                    created_at = datetime.fromtimestamp(
-                        path_obj.stat().st_mtime
-                    ).strftime("%Y%m%dT%H%M%S")
-                except Exception:
-                    created_at = datetime.now().strftime("%Y%m%dT%H%M%S")
+                    for time_format in time_formats:
+                        try:
+                            created_at = datetime.strptime(
+                                time_text, time_format
+                            ).strftime("%Y%m%dT%H%M%S")
+                            break
+                        except ValueError:
+                            continue
+                    else:
+                        raise ValueError(
+                            f"Không đọc được thời gian từ tên file: {file_name}"
+                        )
+                except ValueError:
+                    # Tên file không có thời gian hợp lệ: dùng mtime của file vật lý.
+                    try:
+                        created_at = datetime.fromtimestamp(
+                            path_obj.stat().st_mtime
+                        ).strftime("%Y%m%dT%H%M%S")
+                    except OSError:
+                        created_at = datetime.now().strftime("%Y%m%dT%H%M%S")
 
                 key_record = f"{cccd}_{created_at}"
 
@@ -177,13 +168,14 @@ def update_image_to_storage():
             print("Không có file nào upload thành công để insert DB.")
             return
 
-        hook = PostgresHook(postgres_conn_id="postgres")
+        hook = PostgresHook(postgres_conn_id="postgres_cccd")
         conn = hook.get_conn()
         cursor = conn.cursor()
 
         insert_query = """
             INSERT INTO images_metadata (key_record, cccd, created_at, s3_uri)
             VALUES (%s, %s, %s, %s)
+            ON CONFLICT (key_record) DO NOTHING
         """
 
         try:
@@ -192,7 +184,8 @@ def update_image_to_storage():
             execute_batch(cursor, insert_query, records, page_size=1000)
             conn.commit()
             print(
-                f"Đã insert thành công {len(records)} bản ghi vào bảng images_metadata"
+                f"Đã xử lý {len(records)} bản ghi; "
+                "các key_record trùng đã được bỏ qua"
             )
         except Exception as e:
             conn.rollback()
@@ -202,10 +195,7 @@ def update_image_to_storage():
             cursor.close()
             conn.close()
 
-    # ──────────────────────────────────────────────
-    # Luồng chạy DAG
-    # ──────────────────────────────────────────────
-    files_path = parse_scanned_files(scan_task.output)
+    files_path = parse_scanned_files(container_folder)
     metadata_img = init_metadata_img(files_path)
     satus_upload_s3 = upload_to_minio(metadata_img)
     update_metadata_to_db(satus_upload_s3)
